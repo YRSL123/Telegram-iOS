@@ -2,6 +2,9 @@ name: YRSL Telegram unsigned IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - yrsl-fake-gifts
 
 permissions:
   contents: read
