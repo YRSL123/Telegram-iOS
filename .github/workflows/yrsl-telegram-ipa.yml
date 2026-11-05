@@ -58,6 +58,17 @@ jobs:
           p.write_text(json.dumps(cfg, indent=2) + '\n')
           PY
 
+      - name: Ensure Xcode Metal Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! xcrun -sdk iphoneos metal --version; then
+            echo 'Metal Toolchain missing on GitHub xcode-27 runner; installing component.'
+            sudo xcodebuild -downloadComponent MetalToolchain
+            xcrun --kill-cache || true
+          fi
+          xcrun -sdk iphoneos metal --version
+
       - name: Build unsigned iPhone IPA
         shell: bash
         run: |
