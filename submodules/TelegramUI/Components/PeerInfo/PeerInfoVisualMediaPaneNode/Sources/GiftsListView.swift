@@ -28,6 +28,17 @@ import LottieComponent
 import ButtonComponent
 import ContextUI
 
+// The local showcase has its own ledger. It never changes StarsContext, sends
+// Telegram payment forms or fabricates a server-owned StarGiftReference.
+private struct YRSLDemoGiftWallet: Codable {
+    var balance: Int64 = 1_000_000
+    var purchasePrices: [String: Int64] = [:]
+    var resalePrices: [String: Int64] = [:]
+    var pinnedGiftIds: [Int64] = []
+    var catalog: [StarGift.UniqueGift] = []
+    var history: [String] = []
+}
+
 final class GiftsListView: UIView {
     private let context: AccountContext
     private let peerId: EnginePeer.Id
@@ -70,6 +81,13 @@ final class GiftsListView: UIView {
             
     private var starsProducts: [ProfileGiftsContext.State.StarGift]?
     private var starsItems: [AnyHashable: (StarGiftReference?, ComponentView<Empty>)] = [:]
+
+    // Visual-only gifts. These never enter ProfileGiftsContext or Telegram's
+    // Postbox cache, and no purchase/transfer request is made for them.
+    private var localDemoGifts: [StarGift.UniqueGift] = []
+    private var localDemoWallet = YRSLDemoGiftWallet()
+    private var localGiftRequestDisposable: Disposable?
+    private let localGiftButton = UIButton(type: .system)
 
     private(set) var resultsAreEmpty = false
     private var filteredResultsAreEmpty = false
@@ -143,6 +161,16 @@ final class GiftsListView: UIView {
         }
         
         super.init(frame: .zero)
+
+        if peerId == context.account.peerId && !canSelect && profileGifts.collectionId == nil {
+            self.loadLocalDemoGifts()
+            self.loadLocalDemoWallet()
+            self.updateLocalDemoButtonTitle()
+            self.localGiftButton.titleLabel?.font = UIFont.systemFont(ofSize: 15.0, weight: .semibold)
+            self.localGiftButton.layer.cornerRadius = 12.0
+            self.localGiftButton.addTarget(self, action: #selector(self.showLocalDemoMarket), for: .touchUpInside)
+            self.addSubview(self.localGiftButton)
+        }
                                         
         self.dataDisposable = combineLatest(
             queue: Queue.mainQueue(),
@@ -154,7 +182,8 @@ final class GiftsListView: UIView {
             }
             let isFirstTime = self.starsProducts == nil
             let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
-            self.statusPromise.set(.single(PeerInfoStatusData(text: presentationData.strings.SharedMedia_GiftCount(state.count ?? 0), isActivity: true, key: .gifts)))
+            let localCount = self.canDisplayLocalDemoGifts(filter: state.filter) ? Int32(self.localDemoGifts.count) : 0
+            self.statusPromise.set(.single(PeerInfoStatusData(text: presentationData.strings.SharedMedia_GiftCount((state.count ?? 0) + localCount), isActivity: true, key: .gifts)))
             
             if self.isReordering {
                 var stateItems: [ProfileGiftsContext.State.StarGift] = state.gifts
@@ -187,12 +216,12 @@ final class GiftsListView: UIView {
                 self.starsProducts = stateItems
                 self.pinnedReferences = Array(stateItems.filter { $0.pinnedToTop }.compactMap { $0.reference })
             } else {
-                self.starsProducts = state.filteredGifts
+                self.starsProducts = self.localDemoProfileGifts(filter: state.filter) + state.filteredGifts
                 self.pinnedReferences = Array(state.gifts.filter { $0.pinnedToTop }.compactMap { $0.reference })
             }
             
-            self.resultsAreEmpty = state.filter == .All && state.gifts.isEmpty && state.dataState != .loading
-            self.filteredResultsAreEmpty = state.filter != .All && state.filteredGifts.isEmpty
+            self.resultsAreEmpty = state.filter == .All && state.gifts.isEmpty && self.localDemoGifts.isEmpty && state.dataState != .loading
+            self.filteredResultsAreEmpty = state.filter != .All && state.filteredGifts.isEmpty && self.localDemoProfileGifts(filter: state.filter).isEmpty
         
             if !self.didSetReady {
                 self.didSetReady = true
@@ -251,6 +280,526 @@ final class GiftsListView: UIView {
     
     deinit {
         self.dataDisposable?.dispose()
+        self.localGiftRequestDisposable?.dispose()
+    }
+
+    private var localDemoStorageKey: String {
+        return "YRSL.LocalGiftDisplay.\(self.context.account.peerId.toInt64())"
+    }
+
+    private var localDemoWalletKey: String {
+        return "YRSL.LocalGiftWallet.v1.\(self.context.account.peerId.toInt64())"
+    }
+
+    private func loadLocalDemoWallet() {
+        guard let data = UserDefaults.standard.data(forKey: self.localDemoWalletKey),
+              let wallet = try? JSONDecoder().decode(YRSLDemoGiftWallet.self, from: data) else {
+            return
+        }
+        self.localDemoWallet = wallet
+        self.localDemoWallet.balance = min(100_000_000, max(0, wallet.balance))
+    }
+
+    private func saveLocalDemoWallet() {
+        self.localDemoWallet.history = Array(self.localDemoWallet.history.prefix(100))
+        self.localDemoWallet.catalog = Array(self.localDemoWallet.catalog.prefix(30))
+        if let data = try? JSONEncoder().encode(self.localDemoWallet) {
+            UserDefaults.standard.set(data, forKey: self.localDemoWalletKey)
+        }
+        self.updateLocalDemoButtonTitle()
+    }
+
+    private func updateLocalDemoButtonTitle() {
+        self.localGiftButton.setTitle("🎁 Демо-маркет   ⭐ \(self.localDemoWallet.balance)", for: .normal)
+    }
+
+    private func recordLocalDemoEvent(_ text: String) {
+        let date = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .short)
+        self.localDemoWallet.history.insert("\(date) · \(text)", at: 0)
+        self.saveLocalDemoWallet()
+    }
+
+    private func demoGiftKey(_ id: Int64) -> String {
+        return String(id)
+    }
+
+    private func loadLocalDemoGifts() {
+        guard let data = UserDefaults.standard.data(forKey: self.localDemoStorageKey),
+              let gifts = try? JSONDecoder().decode([StarGift.UniqueGift].self, from: data) else {
+            return
+        }
+        self.localDemoGifts = Array(gifts.prefix(100))
+    }
+
+    private func saveLocalDemoGifts() {
+        if let data = try? JSONEncoder().encode(self.localDemoGifts) {
+            UserDefaults.standard.set(data, forKey: self.localDemoStorageKey)
+        }
+    }
+
+    private func canDisplayLocalDemoGifts(filter: ProfileGiftsContext.Filters) -> Bool {
+        return self.peerId == self.context.account.peerId
+            && !self.canSelect
+            && self.profileGifts.collectionId == nil
+            && filter.contains(.unique)
+    }
+
+    private func localDemoProfileGifts(filter: ProfileGiftsContext.Filters) -> [ProfileGiftsContext.State.StarGift] {
+        guard self.canDisplayLocalDemoGifts(filter: filter) else {
+            return []
+        }
+        let orderedGifts = self.localDemoGifts.sorted { lhs, rhs in
+            let lhsPinned = self.localDemoWallet.pinnedGiftIds.contains(lhs.id)
+            let rhsPinned = self.localDemoWallet.pinnedGiftIds.contains(rhs.id)
+            return lhsPinned && !rhsPinned
+        }
+        return orderedGifts.map { gift in
+            ProfileGiftsContext.State.StarGift(
+                gift: .unique(gift),
+                reference: nil,
+                fromPeer: nil,
+                date: Int32(Date().timeIntervalSince1970),
+                text: nil,
+                entities: nil,
+                nameHidden: true,
+                savedToProfile: true,
+                pinnedToTop: self.localDemoWallet.pinnedGiftIds.contains(gift.id),
+                convertStars: nil,
+                canUpgrade: false,
+                canExportDate: nil,
+                upgradeStars: nil,
+                transferStars: nil,
+                canTransferDate: nil,
+                canResaleDate: nil,
+                collectionIds: nil,
+                prepaidUpgradeHash: nil,
+                upgradeSeparate: false,
+                dropOriginalDetailsStars: nil,
+                number: nil,
+                isRefunded: false,
+                canCraftAt: nil
+            )
+        }
+    }
+
+    private func isLocalDemoGift(_ product: ProfileGiftsContext.State.StarGift) -> Bool {
+        guard case let .unique(gift) = product.gift else {
+            return false
+        }
+        return self.localDemoGifts.contains(where: { $0.id == gift.id })
+    }
+
+    private func refreshLocalDemoGifts() {
+        guard let state = self.profileGifts.currentState else {
+            return
+        }
+        let localIds = Set(self.localDemoGifts.map { $0.id })
+        let realProducts = (self.starsProducts ?? []).filter { product in
+            if case let .unique(gift) = product.gift {
+                return gift.id >= 0 && !localIds.contains(gift.id)
+            }
+            return true
+        }
+        self.starsProducts = self.localDemoProfileGifts(filter: state.filter) + realProducts
+        let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
+        let localCount = self.canDisplayLocalDemoGifts(filter: state.filter) ? Int32(self.localDemoGifts.count) : 0
+        self.statusPromise.set(.single(PeerInfoStatusData(text: presentationData.strings.SharedMedia_GiftCount((state.count ?? 0) + localCount), isActivity: true, key: .gifts)))
+        self.resultsAreEmpty = state.filter == .All && state.gifts.isEmpty && self.localDemoGifts.isEmpty && state.dataState != .loading
+        self.filteredResultsAreEmpty = state.filter != .All && state.filteredGifts.isEmpty && self.localDemoProfileGifts(filter: state.filter).isEmpty
+        self.updateScrolling(transition: .easeInOut(duration: 0.25))
+        self.onContentUpdated()
+    }
+
+    private func showLocalGiftMessage(_ title: String, _ message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        self.parentController?.present(alert, animated: true)
+    }
+
+    private func presentLocalDemoMenu(_ alert: UIAlertController) {
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = self.localGiftButton
+            popover.sourceRect = self.localGiftButton.bounds
+        }
+        self.parentController?.present(alert, animated: true)
+    }
+
+    @objc private func showLocalDemoMarket() {
+        let alert = UIAlertController(
+            title: "Подарки · демо",
+            message: "⭐ \(self.localDemoWallet.balance) · Все покупки и отправки существуют только на этом iPhone.",
+            preferredStyle: .actionSheet
+        )
+        alert.addAction(UIAlertAction(title: "Маркет коллекционных подарков", style: .default, handler: { [weak self] _ in
+            self?.showLocalCatalog()
+        }))
+        alert.addAction(UIAlertAction(title: "Пополнить демо-Stars", style: .default, handler: { [weak self] _ in
+            self?.showLocalDemoTopUp()
+        }))
+        alert.addAction(UIAlertAction(title: "Подарить демо-Stars", style: .default, handler: { [weak self] _ in
+            self?.promptLocalDemoStarsGift()
+        }))
+        alert.addAction(UIAlertAction(title: "История операций", style: .default, handler: { [weak self] _ in
+            self?.showLocalDemoHistory()
+        }))
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        self.presentLocalDemoMenu(alert)
+    }
+
+    private func showLocalCatalog() {
+        let alert = UIAlertController(
+            title: "Маркет NFT · демо",
+            message: "Выбери просмотренный подарок или найди настоящий NFT по ссылке t.me/nft/…",
+            preferredStyle: .actionSheet
+        )
+        alert.addAction(UIAlertAction(title: "Поиск подарка по ссылке", style: .default, handler: { [weak self] _ in
+            self?.addLocalGiftPressed()
+        }))
+        for source in self.localDemoWallet.catalog.prefix(12) {
+            alert.addAction(UIAlertAction(title: "\(source.title) #\(source.number)", style: .default, handler: { [weak self] _ in
+                self?.showLocalGiftOffer(source, number: source.number, price: self?.localDemoPrice(for: source) ?? 1_000)
+            }))
+        }
+        alert.addAction(UIAlertAction(title: "Назад", style: .cancel))
+        self.presentLocalDemoMenu(alert)
+    }
+
+    private func localDemoPrice(for source: StarGift.UniqueGift) -> Int64 {
+        return max(1, source.resellAmounts?.first(where: { $0.currency == .stars })?.amount.value ?? 1_000)
+    }
+
+    private func showLocalGiftOffer(_ source: StarGift.UniqueGift, number: Int32, price: Int64) {
+        let alert = UIAlertController(
+            title: "\(source.title) #\(number)",
+            message: "Цена: ⭐ \(price) · Баланс: ⭐ \(self.localDemoWallet.balance)\nДемо-покупка: реальные Stars не списываются.",
+            preferredStyle: .actionSheet
+        )
+        alert.addAction(UIAlertAction(title: "Посмотреть подарок", style: .default, handler: { [weak self] _ in
+            guard let self else { return }
+            // The preview has no marketplace owner or server reference.
+            let preview = self.copyLocalGift(source, id: -9_999_999_999, number: number)
+            self.parentController?.push(GiftViewScreen(context: self.context, subject: .uniqueGift(preview, self.peerId)))
+        }))
+        alert.addAction(UIAlertAction(title: "Купить себе · ⭐ \(price)", style: .default, handler: { [weak self] _ in
+            self?.confirmLocalDemoPurchase(source, number: number, price: price, recipient: nil)
+        }))
+        alert.addAction(UIAlertAction(title: "Отправить другу · ⭐ \(price)", style: .default, handler: { [weak self] _ in
+            self?.promptLocalDemoRecipient(title: "Отправить \(source.title)", message: "Введи имя или @username. Друг ничего не получит: это локальная демонстрация.") { [weak self] recipient in
+                self?.confirmLocalDemoPurchase(source, number: number, price: price, recipient: recipient)
+            }
+        }))
+        alert.addAction(UIAlertAction(title: "Изменить демо-цену", style: .default, handler: { [weak self] _ in
+            self?.promptLocalDemoAmount(title: "Цена NFT", initial: price) { [weak self] amount in
+                self?.showLocalGiftOffer(source, number: number, price: amount)
+            }
+        }))
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        self.presentLocalDemoMenu(alert)
+    }
+
+    private func confirmLocalDemoPurchase(_ source: StarGift.UniqueGift, number: Int32, price: Int64, recipient: String?) {
+        guard price > 0, self.localDemoWallet.balance >= price else {
+            self.showLocalGiftMessage("Недостаточно демо-Stars", "Пополнить локальный баланс можно в меню подарков.")
+            return
+        }
+        let target = recipient.map { "для \($0)" } ?? "для себя"
+        let alert = UIAlertController(title: "Покупка \(target)", message: "\(source.title) #\(number) за ⭐ \(price)\nЭто только демонстрация на твоём устройстве.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Подтвердить", style: .default, handler: { [weak self] _ in
+            guard let self, self.localDemoWallet.balance >= price else { return }
+            self.localDemoWallet.balance -= price
+            if let recipient {
+                self.recordLocalDemoEvent("Подарок \(source.title) #\(number) → \(recipient): −⭐\(price) (демо)")
+                self.showLocalGiftMessage("Подарок отправлен · демо", "Отправка отображается в истории этого приложения. У получателя в Telegram ничего не появилось.")
+            } else {
+                var id = -Int64(Date().timeIntervalSince1970 * 1000.0)
+                while self.localDemoGifts.contains(where: { $0.id == id }) { id -= 1 }
+                let gift = self.copyLocalGift(source, id: id, number: number)
+                self.localDemoGifts.insert(gift, at: 0)
+                self.localDemoGifts = Array(self.localDemoGifts.prefix(100))
+                self.localDemoWallet.purchasePrices[self.demoGiftKey(id)] = price
+                self.saveLocalDemoGifts()
+                self.recordLocalDemoEvent("Куплен \(source.title) #\(number): −⭐\(price) (демо)")
+                self.refreshLocalDemoGifts()
+                self.showLocalGiftMessage("Подарок в коллекции", "Он появился в твоём профиле только в модифицированном Telegram.")
+            }
+        }))
+        self.parentController?.present(alert, animated: true)
+    }
+
+    private func promptLocalDemoAmount(title: String, initial: Int64, completion: @escaping (Int64) -> Void) {
+        let alert = UIAlertController(title: title, message: "Укажи положительное количество демо-Stars (до 100 миллионов).", preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = String(initial)
+            field.keyboardType = .numberPad
+        }
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Далее", style: .default, handler: { [weak self, weak alert] _ in
+            guard let value = alert?.textFields?.first?.text,
+                  let amount = Int64(value), (1...100_000_000).contains(amount) else {
+                self?.showLocalGiftMessage("Неверное количество", "Укажи число от 1 до 100 000 000.")
+                return
+            }
+            completion(amount)
+        }))
+        self.parentController?.present(alert, animated: true)
+    }
+
+    private func promptLocalDemoRecipient(title: String, message: String, completion: @escaping (String) -> Void) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.placeholder = "@username"
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Далее", style: .default, handler: { [weak self, weak alert] _ in
+            let name = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !name.isEmpty && name.count <= 64 && !name.contains("\n") else {
+                self?.showLocalGiftMessage("Укажи получателя", "Введи имя или @username длиной до 64 символов.")
+                return
+            }
+            completion(name)
+        }))
+        self.parentController?.present(alert, animated: true)
+    }
+
+    private func showLocalDemoTopUp() {
+        let alert = UIAlertController(title: "Пополнить демо-Stars", message: "Баланс: ⭐ \(self.localDemoWallet.balance). Настоящие Stars не начисляются.", preferredStyle: .actionSheet)
+        for amount in [Int64(1_000), 10_000, 100_000, 1_000_000] {
+            alert.addAction(UIAlertAction(title: "+ ⭐ \(amount)", style: .default, handler: { [weak self] _ in
+                guard let self else { return }
+                self.localDemoWallet.balance = min(100_000_000, self.localDemoWallet.balance + amount)
+                self.recordLocalDemoEvent("Пополнение демо-баланса: +⭐\(amount)")
+                self.showLocalGiftMessage("Баланс обновлён", "Доступно ⭐ \(self.localDemoWallet.balance) только в локальном демо.")
+            }))
+        }
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        self.presentLocalDemoMenu(alert)
+    }
+
+    private func promptLocalDemoStarsGift() {
+        self.promptLocalDemoAmount(title: "Подарить демо-Stars", initial: 1_000) { [weak self] amount in
+            guard let self else { return }
+            self.promptLocalDemoRecipient(title: "Кому подарить ⭐ \(amount)?", message: "Получатель увидит это только в истории на твоём iPhone.") { [weak self] recipient in
+                guard let self else { return }
+                guard self.localDemoWallet.balance >= amount else {
+                    self.showLocalGiftMessage("Недостаточно демо-Stars", "Пополнить баланс можно в меню подарков.")
+                    return
+                }
+                self.localDemoWallet.balance -= amount
+                self.recordLocalDemoEvent("Демо-Stars → \(recipient): −⭐\(amount)")
+                self.showLocalGiftMessage("Stars подарены · демо", "Запись добавлена в локальную историю. Настоящие звёзды не передавались.")
+            }
+        }
+    }
+
+    private func showLocalDemoHistory() {
+        let history = self.localDemoWallet.history.prefix(12).joined(separator: "\n\n")
+        self.showLocalGiftMessage("История · демо", history.isEmpty ? "Операций пока нет." : history)
+    }
+
+    @objc private func addLocalGiftPressed() {
+        let alert = UIAlertController(
+            title: "Найти NFT на маркете",
+            message: "Вставь ссылку настоящего коллекционного подарка. Затем выбери демо-покупку себе или другу.",
+            preferredStyle: .alert
+        )
+        alert.addTextField { field in
+            field.placeholder = "https://t.me/nft/PlushPepe-1234"
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addTextField { field in
+            field.placeholder = "Номер (необязательно)"
+            field.keyboardType = .numberPad
+        }
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Найти", style: .default, handler: { [weak self, weak alert] _ in
+            guard let self, let fields = alert?.textFields,
+                  let raw = fields.first?.text,
+                  let slug = self.localGiftSlug(from: raw) else {
+                self?.showLocalGiftMessage("Неверная ссылка", "Вставь адрес вида t.me/nft/PlushPepe-1234")
+                return
+            }
+            let desiredNumber: Int32?
+            if let entered = fields.last?.text?.trimmingCharacters(in: .whitespacesAndNewlines), !entered.isEmpty {
+                guard let number = Int32(entered), number > 0 else {
+                    self.showLocalGiftMessage("Неверный номер", "Укажи положительное целое число.")
+                    return
+                }
+                desiredNumber = number
+            } else {
+                desiredNumber = nil
+            }
+            self.localGiftRequestDisposable?.dispose()
+            self.localGiftRequestDisposable = (self.context.engine.payments.getUniqueStarGift(slug: slug)
+            |> deliverOnMainQueue).start(next: { [weak self] source in
+                guard let self else { return }
+                let number = desiredNumber ?? source.number
+                self.localDemoWallet.catalog.removeAll(where: { $0.slug == source.slug })
+                self.localDemoWallet.catalog.insert(source, at: 0)
+                self.saveLocalDemoWallet()
+                self.showLocalGiftOffer(source, number: number, price: self.localDemoPrice(for: source))
+            }, error: { [weak self] _ in
+                self?.showLocalGiftMessage("Не удалось загрузить", "Telegram не нашёл такой NFT. Проверь ссылку и подключение к сети.")
+            })
+        }))
+        self.parentController?.present(alert, animated: true)
+    }
+
+    private func localGiftSlug(from raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        if text.contains("/") {
+            guard let url = URL(string: text.hasPrefix("http") ? text : "https://\(text)"),
+                  let host = url.host?.lowercased(),
+                  ["t.me", "www.t.me", "telegram.me", "www.telegram.me"].contains(host) else {
+                return nil
+            }
+            let parts = url.pathComponents.filter { $0 != "/" }
+            guard parts.count == 2, parts[0].lowercased() == "nft" else { return nil }
+            return parts[1]
+        }
+        return text.range(of: "^[A-Za-z0-9_-]+$", options: .regularExpression) != nil ? text : nil
+    }
+
+    private func copyLocalGift(_ source: StarGift.UniqueGift, id: Int64, number: Int32) -> StarGift.UniqueGift {
+        let attributes = source.attributes.filter { attribute in
+            if case .originalInfo = attribute { return false }
+            return true
+        }
+        return StarGift.UniqueGift(
+            id: id,
+            giftId: source.giftId,
+            title: source.title,
+            number: number,
+            slug: source.slug,
+            owner: .peerId(self.context.account.peerId),
+            attributes: attributes,
+            availability: source.availability,
+            giftAddress: nil,
+            resellAmounts: nil,
+            resellForTonOnly: false,
+            releasedBy: source.releasedBy,
+            valueAmount: nil,
+            valueCurrency: nil,
+            valueUsdAmount: nil,
+            flags: [],
+            themePeerId: nil,
+            peerColor: nil,
+            hostPeerId: nil,
+            minOfferStars: nil,
+            craftChancePermille: nil
+        )
+    }
+
+    private func showLocalGiftOptions(_ product: ProfileGiftsContext.State.StarGift) {
+        guard case let .unique(gift) = product.gift else { return }
+        let key = self.demoGiftKey(gift.id)
+        let salePrice = self.localDemoWallet.resalePrices[key]
+        let isPinned = self.localDemoWallet.pinnedGiftIds.contains(gift.id)
+        let alert = UIAlertController(title: "\(gift.title) #\(gift.number)", message: "Коллекционный подарок · локальное демо", preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "Посмотреть подарок", style: .default, handler: { [weak self] _ in
+            guard let self else { return }
+            self.parentController?.push(GiftViewScreen(context: self.context, subject: .uniqueGift(gift, self.peerId)))
+        }))
+        alert.addAction(UIAlertAction(title: isPinned ? "Открепить от профиля" : "Закрепить в профиле", style: .default, handler: { [weak self] _ in
+            guard let self else { return }
+            if isPinned {
+                self.localDemoWallet.pinnedGiftIds.removeAll(where: { $0 == gift.id })
+            } else {
+                if self.localDemoWallet.pinnedGiftIds.count + self.pinnedReferences.count >= self.maxPinnedCount {
+                    self.showLocalGiftMessage("Достигнут лимит", "Можно закрепить максимум \(self.maxPinnedCount) подарков.")
+                    return
+                }
+                self.localDemoWallet.pinnedGiftIds.append(gift.id)
+            }
+            self.saveLocalDemoWallet()
+            self.refreshLocalDemoGifts()
+        }))
+        alert.addAction(UIAlertAction(title: "Передать подарок", style: .default, handler: { [weak self] _ in
+            self?.promptLocalDemoRecipient(title: "Передать \(gift.title)", message: "Подарок исчезнет из твоей локальной коллекции, но другой пользователь его не получит.") { [weak self] recipient in
+                guard let self else { return }
+                self.removeLocalDemoGift(gift.id)
+                self.recordLocalDemoEvent("Передан \(gift.title) #\(gift.number) → \(recipient) (демо)")
+                self.showLocalGiftMessage("Подарок передан · демо", "Передача записана в истории только на этом iPhone.")
+            }
+        }))
+        if let salePrice {
+            alert.addAction(UIAlertAction(title: "Снять с продажи · ⭐ \(salePrice)", style: .default, handler: { [weak self] _ in
+                guard let self else { return }
+                self.localDemoWallet.resalePrices.removeValue(forKey: key)
+                self.recordLocalDemoEvent("Снят с продажи \(gift.title) #\(gift.number)")
+                self.refreshLocalDemoGifts()
+            }))
+            alert.addAction(UIAlertAction(title: "Симулировать продажу · ⭐ \(salePrice)", style: .default, handler: { [weak self] _ in
+                guard let self else { return }
+                self.removeLocalDemoGift(gift.id)
+                self.localDemoWallet.balance = min(100_000_000, self.localDemoWallet.balance + salePrice)
+                self.recordLocalDemoEvent("Продан \(gift.title) #\(gift.number): +⭐\(salePrice) (демо)")
+                self.showLocalGiftMessage("Подарок продан · демо", "Демо-Stars начислены локально. На настоящем маркете ничего не продавалось.")
+            }))
+        } else {
+            alert.addAction(UIAlertAction(title: "Выставить на продажу", style: .default, handler: { [weak self] _ in
+                guard let self else { return }
+                let suggested = self.localDemoWallet.purchasePrices[key] ?? 1_000
+                self.promptLocalDemoAmount(title: "Цена перепродажи", initial: suggested) { [weak self] price in
+                    guard let self else { return }
+                    self.localDemoWallet.resalePrices[key] = price
+                    self.recordLocalDemoEvent("Выставлен \(gift.title) #\(gift.number) за ⭐\(price) (демо)")
+                    self.refreshLocalDemoGifts()
+                }
+            }))
+        }
+        let convertAmount = max(1, (self.localDemoWallet.purchasePrices[key] ?? 1_000) / 2)
+        alert.addAction(UIAlertAction(title: "Обменять на ⭐ \(convertAmount)", style: .default, handler: { [weak self] _ in
+            guard let self else { return }
+            let confirm = UIAlertController(title: "Обменять на Stars?", message: "Подарок будет удалён из демо-коллекции, а ⭐\(convertAmount) появятся в демо-кошельке.", preferredStyle: .alert)
+            confirm.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+            confirm.addAction(UIAlertAction(title: "Обменять", style: .destructive, handler: { [weak self] _ in
+                guard let self else { return }
+                self.removeLocalDemoGift(gift.id)
+                self.localDemoWallet.balance = min(100_000_000, self.localDemoWallet.balance + convertAmount)
+                self.recordLocalDemoEvent("Обменян \(gift.title) #\(gift.number): +⭐\(convertAmount) (демо)")
+            }))
+            self.parentController?.present(confirm, animated: true)
+        }))
+        alert.addAction(UIAlertAction(title: "Изменить номер", style: .default, handler: { [weak self] _ in
+            guard let self else { return }
+            let edit = UIAlertController(title: "Номер подарка", message: nil, preferredStyle: .alert)
+            edit.addTextField { field in
+                field.text = "\(gift.number)"
+                field.keyboardType = .numberPad
+            }
+            edit.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+            edit.addAction(UIAlertAction(title: "Сохранить", style: .default, handler: { [weak self, weak edit] _ in
+                guard let self, let text = edit?.textFields?.first?.text,
+                      let number = Int32(text), number > 0,
+                      let index = self.localDemoGifts.firstIndex(where: { $0.id == gift.id }) else { return }
+                self.localDemoGifts[index] = self.copyLocalGift(self.localDemoGifts[index], id: gift.id, number: number)
+                self.saveLocalDemoGifts()
+                self.refreshLocalDemoGifts()
+            }))
+            self.parentController?.present(edit, animated: true)
+        }))
+        alert.addAction(UIAlertAction(title: "Удалить из демонстрации", style: .destructive, handler: { [weak self] _ in
+            guard let self else { return }
+            self.removeLocalDemoGift(gift.id)
+            self.recordLocalDemoEvent("Удалён \(gift.title) #\(gift.number) из демо-коллекции")
+        }))
+        alert.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        self.presentLocalDemoMenu(alert)
+    }
+
+    private func removeLocalDemoGift(_ id: Int64) {
+        self.localDemoGifts.removeAll(where: { $0.id == id })
+        self.localDemoWallet.purchasePrices.removeValue(forKey: self.demoGiftKey(id))
+        self.localDemoWallet.resalePrices.removeValue(forKey: self.demoGiftKey(id))
+        self.localDemoWallet.pinnedGiftIds.removeAll(where: { $0 == id })
+        self.saveLocalDemoGifts()
+        self.saveLocalDemoWallet()
+        self.refreshLocalDemoGifts()
     }
         
     func item(at point: CGPoint) -> (AnyHashable, ComponentView<Empty>)? {
@@ -506,7 +1055,11 @@ final class GiftsListView: UIView {
                     }
                     resellAmount = gift.resellAmounts?.first(where: { $0.currency == .stars })
                     
-                    if !(gift.resellAmounts ?? []).isEmpty {
+                    if self.isLocalDemoGift(product), let demoResalePrice = self.localDemoWallet.resalePrices[self.demoGiftKey(gift.id)] {
+                        ribbonText = "⭐\(demoResalePrice)"
+                        ribbonFont = .larger
+                        ribbonColor = .green
+                    } else if !(gift.resellAmounts ?? []).isEmpty {
                         ribbonText = params.presentationData.strings.PeerInfo_Gifts_Sale
                         ribbonFont = .larger
                         ribbonColor = .green
@@ -556,7 +1109,9 @@ final class GiftsListView: UIView {
                                 guard let self, !isAdded, let presentationData = self.currentParams?.presentationData else {
                                     return
                                 }
-                                if self.canSelect {
+                                if self.isLocalDemoGift(product) {
+                                    self.showLocalGiftOptions(product)
+                                } else if self.canSelect {
                                     if self.selectedItemIds.contains(itemReferenceId) {
                                         self.selectedItemIds.remove(itemReferenceId)
                                     } else {
@@ -597,8 +1152,9 @@ final class GiftsListView: UIView {
                                         }
                                     }
                                 } else {
-                                    let allSubjects: [GiftViewScreen.Subject] = (self.starsProducts ?? []).map { .profileGift(self.peerId, $0) }
-                                    let index = self.starsProducts?.firstIndex(where: { $0 == product }) ?? 0
+                                    let realProducts = (self.starsProducts ?? []).filter { !self.isLocalDemoGift($0) }
+                                    let allSubjects: [GiftViewScreen.Subject] = realProducts.map { .profileGift(self.peerId, $0) }
+                                    let index = realProducts.firstIndex(where: { $0 == product }) ?? 0
                                     
                                     var dismissImpl: (() -> Void)?
                                     let controller = GiftViewScreen(
@@ -695,7 +1251,11 @@ final class GiftsListView: UIView {
                                 guard let self else {
                                     return
                                 }
-                                self.contextAction?(product, view, gesture)
+                                if self.isLocalDemoGift(product) {
+                                    self.showLocalGiftOptions(product)
+                                } else {
+                                    self.contextAction?(product, view, gesture)
+                                }
                             }
                         )
                     ),
@@ -789,6 +1349,20 @@ final class GiftsListView: UIView {
         let effectiveBottomInset = max(8.0, bottomInset)
         let bottomPanelHeight = effectiveBottomInset + buttonSize.height + 8.0
         let visibleHeight = params.visibleHeight
+
+        let showLocalGiftButton = self.canDisplayLocalDemoGifts(filter: self.profileGifts.currentState?.filter ?? .All) && !self.isReordering
+        self.localGiftButton.isHidden = !showLocalGiftButton
+        if showLocalGiftButton {
+            self.localGiftButton.backgroundColor = presentationData.theme.list.blocksBackgroundColor
+            self.localGiftButton.setTitleColor(presentationData.theme.list.itemAccentColor, for: .normal)
+            self.localGiftButton.frame = CGRect(
+                x: buttonSideInset,
+                y: contentHeight + 10.0,
+                width: buttonSize.width,
+                height: 44.0
+            )
+            contentHeight += 64.0
+        }
         
         let panelTransition = ComponentTransition.immediate
         let fadeTransition = ComponentTransition.easeInOut(duration: 0.25)
