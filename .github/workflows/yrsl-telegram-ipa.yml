@@ -46,7 +46,8 @@ jobs:
           from pathlib import Path
           p = Path('build-system/appstore-configuration.json')
           cfg = json.loads(p.read_text())
-          cfg['bundle_id'] = 'com.yrsl.telegram.demo'
+          # Keep upstream bundle ID for compatibility with the bundled fake provisioning profiles.
+          # AltStore will re-sign the resulting IPA for installation.
           cfg['api_id'] = os.environ['TELEGRAM_API_ID']
           cfg['api_hash'] = os.environ['TELEGRAM_API_HASH']
           cfg['app_specific_url_scheme'] = 'yrsltelegram'
@@ -70,8 +71,13 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="${GITHUB_RUN_NUMBER}"
           mkdir -p build/yrsl-artifacts
-          test -f bazel-bin/Telegram/Telegram.ipa
-          cp bazel-bin/Telegram/Telegram.ipa build/yrsl-artifacts/YRSLTelegram-unsigned.ipa
+          for candidate in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa bazel-bin/Telegram/Telegram.ipa; do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" build/yrsl-artifacts/YRSLTelegram-unsigned.ipa
+              break
+            fi
+          done
+          test -s build/yrsl-artifacts/YRSLTelegram-unsigned.ipa
 
       - name: Upload IPA for AltStore signing
         uses: actions/upload-artifact@v4
